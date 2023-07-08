@@ -34,24 +34,27 @@ impl<T> SegmentHeap<T> {
             let inner = self.inner.load_full();
             match inner.as_ref().and_then(|x| x.alloc()) {
                 Some(p) => return p,
-                None => {
-                    match self.alloc_lock.try_lock() {
-                        // we have the alloc lock. we can allocate the segment
-                        Ok(_lock) => {
-                            let cap = inner.as_ref().map_or(1, |x| x.head.slots.len() * 2);
-                            let new = SegmentHeapInner {
-                                head: SingleSegment::new(cap),
-                                tail: ArcSwapOption::new(inner),
-                            };
-                            self.inner.swap(Some(Arc::new(new)));
-                        }
-                        // someone else is allocating the new segment
-                        Err(_) => {
-                            // wait
-                            let _lock = self.alloc_lock.lock().unwrap();
-                        }
-                    }
-                }
+                None => self.alloc_new_segment(inner),
+            }
+        }
+    }
+
+    #[cold]
+    fn alloc_new_segment(&self, inner: Option<Arc<SegmentHeapInner<T>>>) {
+        match self.alloc_lock.try_lock() {
+            // we have the alloc lock. we can allocate the segment
+            Ok(_lock) => {
+                let cap = inner.as_ref().map_or(1, |x| x.head.slots.len() * 2);
+                let new = SegmentHeapInner {
+                    head: SingleSegment::new(cap),
+                    tail: ArcSwapOption::new(inner),
+                };
+                self.inner.swap(Some(Arc::new(new)));
+            }
+            // someone else is allocating the new segment
+            Err(_) => {
+                // wait
+                let _lock = self.alloc_lock.lock().unwrap();
             }
         }
     }
