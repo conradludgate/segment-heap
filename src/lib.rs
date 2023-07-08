@@ -72,7 +72,11 @@ impl<T> SegmentHeap<T> {
 
         let slot_ptr = ptr.as_ptr().cast::<u8>().sub(offset).cast::<Slot<T>>();
         debug_assert_eq!(addr_of_mut!((*slot_ptr).value).cast(), ptr.as_ptr());
-        unsafe { self.inner.load().as_ref().unwrap_unchecked() }.dealloc(slot_ptr);
+
+        let inner = unsafe { self.inner.load_full().unwrap_unchecked() };
+        if inner.dealloc(slot_ptr) == 0 {
+            self.inner.compare_and_swap(&inner, inner.tail.load_full());
+        }
     }
 }
 
@@ -85,8 +89,7 @@ impl<T> SegmentHeapInner<T> {
     fn alloc(&self) -> Option<NonNull<T>> {
         // we don't fall back to tail. we stop using the tail to allocate as it's slower
         // eventually we deallocate it
-        let x = self.head.alloc()?;
-        Some(x)
+        self.head.alloc()
     }
 
     /// # Safety:
@@ -94,16 +97,21 @@ impl<T> SegmentHeapInner<T> {
     unsafe fn dealloc(&self, ptr: *mut Slot<T>) -> usize {
         match self.head.dealloc(ptr) {
             usize::MAX => {
-                if let Some(tail) = &*self.tail.load() {
-                    if tail.dealloc(ptr) == 0 {
-                        self.tail.store(tail.tail.load_full());
-                    }
-                } else if cfg!(debug_assertions) {
-                    panic!("pointer not allocated in this segment heap")
-                }
+                self.dealloc_tail(ptr);
                 usize::MAX
             }
             len => len,
+        }
+    }
+
+    #[cold]
+    unsafe fn dealloc_tail(&self, ptr: *mut Slot<T>) {
+        if let Some(tail) = &*self.tail.load() {
+            if tail.dealloc(ptr) == 0 {
+                self.tail.compare_and_swap(tail, tail.tail.load_full());
+            }
+        } else if cfg!(debug_assertions) {
+            panic!("pointer not allocated in this segment heap")
         }
     }
 }
@@ -182,6 +190,7 @@ impl<T> SingleSegment<T> {
         self.length.fetch_sub(1, Ordering::Acquire) - 1
     }
 
+    #[inline]
     fn alloc(&self) -> Option<NonNull<T>> {
         let mut head = self.head.load(Ordering::Acquire);
         let slot = loop {
