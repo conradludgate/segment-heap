@@ -4,14 +4,17 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use segment_heap::SegmentHeap;
 
 fn alloc(c: &mut Criterion) {
-    const SIZES: [usize; 4] = [(1 << 4) - 1, (1 << 8) - 1, (1 << 12) - 1, (1 << 16) - 1];
-    for size in SIZES {
-        c.bench_with_input(BenchmarkId::new("segment-heap", size), &size, |b, size| {
+    let mut g = c.benchmark_group("alloc");
+    let sizes: Vec<usize> = (1..=8).map(|x| (1 << (x*2)) - 1).collect();
+    for size in sizes {
+        g.bench_with_input(BenchmarkId::new("segment", size), &size, |b, size| {
             let mut store = Vec::with_capacity(*size);
             b.iter(|| {
                 let heap = SegmentHeap::<usize>::new();
-                for _ in 0..*size {
-                    store.push(black_box(heap.alloc()));
+                for i in 0..*size {
+                    let ptr = heap.alloc();
+                    unsafe { ptr.as_ptr().write(i) };
+                    store.push(black_box(ptr));
                 }
                 for ptr in store.drain(..) {
                     unsafe { heap.dealloc(black_box(ptr)) }
@@ -20,12 +23,14 @@ fn alloc(c: &mut Criterion) {
             })
         });
 
-        c.bench_with_input(BenchmarkId::new("global", size), &size, |b, size| {
+        g.bench_with_input(BenchmarkId::new("global", size), &size, |b, size| {
             let mut store = Vec::with_capacity(*size);
             let layout = Layout::new::<usize>();
             b.iter(|| {
-                for _ in 0..*size {
-                    unsafe { store.push(black_box(std::alloc::alloc(layout))) };
+                for i in 0..*size {
+                    let ptr = unsafe { std::alloc::alloc(layout) };
+                    unsafe { ptr.cast::<usize>().write(i) };
+                    store.push(black_box(ptr));
                 }
                 for ptr in store.drain(..) {
                     unsafe { std::alloc::dealloc(black_box(ptr), layout) }
@@ -33,6 +38,7 @@ fn alloc(c: &mut Criterion) {
             })
         });
     }
+    g.finish()
 }
 
 criterion_group!(benches, alloc);
