@@ -12,7 +12,7 @@ fn alloc(c: &mut Criterion) {
     g.plot_config(PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic));
 
     let sizes: Vec<usize> = (4..=12).map(|x| (1 << x) - 1).collect();
-    let mut heap = SegmentHeap::<BigType>::new();
+    let heap = SegmentHeap::<BigType>::new();
     for size in &sizes {
         g.bench_with_input(BenchmarkId::new("segment", size), size, |b, size| {
             let mut store = Vec::with_capacity(*size);
