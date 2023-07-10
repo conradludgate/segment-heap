@@ -1,6 +1,7 @@
 #![feature(alloc_layout_extra)]
 #![allow(clippy::never_loop, clippy::while_immutable_condition)]
 
+use core::fmt;
 use std::{
     alloc::{handle_alloc_error, Layout},
     marker::PhantomData,
@@ -8,17 +9,30 @@ use std::{
     ptr::{addr_of, addr_of_mut, NonNull},
     sync::{
         atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
-        RwLock,
+        OnceLock, RwLock,
     },
 };
 
-use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
+use nix::{
+    sys::mman::{mmap, munmap, MapFlags, ProtFlags},
+    unistd::{sysconf, SysconfVar},
+};
 
 pub struct SegmentHeap<T> {
     inner: [RwLock<SingleSegment>; 31],
     // bit mask of allocated segments
     segments: AtomicU32,
     _t: PhantomData<T>,
+}
+
+impl<T> fmt::Debug for SegmentHeap<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SegmentHeap")
+            .field("inner", &self.inner)
+            .field("segments", &self.segments)
+            .field("_t", &self._t)
+            .finish()
+    }
 }
 
 impl<T> Default for SegmentHeap<T> {
@@ -28,15 +42,13 @@ impl<T> Default for SegmentHeap<T> {
 }
 
 impl<T> SegmentHeap<T> {
-    const VALID_ALIGNMENT: () = {
-        assert!(std::mem::align_of::<T>() <= 4096);
-    };
+    fn state(segment: u8) -> StateSegment {
+        StateSegment::new::<T>(segment)
+    }
 
     pub const fn new() -> Self {
         #[allow(clippy::declare_interior_mutable_const)]
         const SEGMENT: RwLock<SingleSegment> = RwLock::new(SingleSegment::new());
-        #[allow(clippy::let_unit_value)]
-        let _valid_alignment = Self::VALID_ALIGNMENT;
         Self {
             inner: [SEGMENT; 31],
             segments: AtomicU32::new(0),
@@ -55,7 +67,7 @@ impl<T> SegmentHeap<T> {
             let s = match self.inner[last_segment as usize]
                 .read()
                 .unwrap()
-                .alloc(StateSegment::new::<T>(last_segment))
+                .alloc(Self::state(last_segment))
             {
                 AllocResult::Alloc(t) => return t.cast(),
                 AllocResult::Full => last_segment + 1,
@@ -71,7 +83,7 @@ impl<T> SegmentHeap<T> {
     fn alloc_segment(&self, s: u8) -> Option<NonNull<T>> {
         if let Ok(mut segment) = self.inner[s as usize].try_write() {
             self.segments.fetch_xor(1 << s, Ordering::Release);
-            return Some(segment.init(StateSegment::new::<T>(s)).cast());
+            return Some(segment.init(Self::state(s)).cast());
         }
         None
     }
@@ -81,25 +93,24 @@ impl<T> SegmentHeap<T> {
     pub unsafe fn dealloc(&self, ptr: NonNull<T>) {
         let mut segments = self.segments.load(Ordering::Acquire);
         let mut segment = 0;
-        // let last_segment = (31 - segments.leading_zeros()) as u8;
-        while segments > 0 {
+        while segments > 1 {
             let len = self.inner[segment as usize]
                 .read()
                 .unwrap()
-                .dealloc(StateSegment::new::<T>(segment), ptr.as_ptr().cast());
+                .dealloc(Self::state(segment), ptr.as_ptr().cast());
 
             match len {
-                usize::MAX => {
+                None => {
                     segment += 1;
                     segments >>= 1;
                     continue;
                 }
-                0 => {
+                Some(0) => {
                     if let Ok(mut seg) = self.inner[segment as usize].try_write() {
                         self.segments.fetch_xor(1 << segment, Ordering::Release);
                         // confirm that we can dealloc
                         if *seg.length.get_mut() == 0 {
-                            seg.release(StateSegment::new::<T>(segment));
+                            seg.release(Self::state(segment));
                         }
                     }
                     return;
@@ -110,7 +121,7 @@ impl<T> SegmentHeap<T> {
         self.inner[segment as usize]
             .read()
             .unwrap()
-            .dealloc(StateSegment::new::<T>(segment), ptr.as_ptr().cast());
+            .dealloc(Self::state(segment), ptr.as_ptr().cast());
     }
 }
 
@@ -130,18 +141,30 @@ struct SingleSegment {
 
 struct StateSegment {
     layout_slot: Layout,
-    offset_t: usize,
+    extra: usize,
     segment: u8,
 }
 
+static PAGE_SIZE: OnceLock<Option<i64>> = OnceLock::new();
 impl StateSegment {
     fn new<T>(segment: u8) -> Self {
         let layout_t = Layout::new::<T>();
-        let (layout_slot, offset_t) = Layout::new::<Slot>().extend(layout_t).unwrap();
-        debug_assert!(layout_slot.align() < 4096);
+        let layout_free = Layout::new::<Slot>();
+        let layout_slot = Layout::from_size_align(
+            usize::max(layout_t.size(), layout_free.size()),
+            usize::max(layout_t.align(), layout_free.align()),
+        )
+        .unwrap();
+
+        let page_size = PAGE_SIZE
+            .get_or_init(|| sysconf(SysconfVar::PAGE_SIZE).unwrap())
+            .unwrap_or(4096);
+
+        let extra = layout_slot.align().saturating_sub(page_size as usize);
+
         Self {
             layout_slot,
-            offset_t,
+            extra,
             segment,
         }
     }
@@ -155,6 +178,17 @@ impl StateSegment {
     }
     fn page_layout(&self) -> (Layout, usize) {
         self.layout_slot.repeat(self.segment_size()).unwrap()
+    }
+}
+
+impl fmt::Debug for SingleSegment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SingleSegment")
+            .field("slots", &self.slots)
+            .field("head", &self.head)
+            .field("length", &self.length)
+            .field("init", &self.init)
+            .finish()
     }
 }
 
@@ -175,7 +209,7 @@ impl SingleSegment {
         let ptr = unsafe {
             mmap(
                 None,
-                NonZeroUsize::new(layout_slots.size()).unwrap(),
+                NonZeroUsize::new(layout_slots.size() + state.extra).unwrap(),
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
                 -1,
@@ -199,13 +233,13 @@ impl SingleSegment {
             length: AtomicUsize::new(1),
             init: AtomicUsize::new(1),
         };
-        unsafe { NonNull::new_unchecked(ptr.add(state.offset_t).cast()) }
+        unsafe { NonNull::new_unchecked(ptr.add(state.extra).cast()) }
     }
 
     #[cold]
     fn release(&mut self, state: StateSegment) {
         let (layout_slots, _) = state.page_layout();
-        unsafe { munmap(self.slots.cast(), layout_slots.size()).unwrap() };
+        unsafe { munmap(self.slots.cast(), layout_slots.size() + state.extra).unwrap() };
         self.slots = std::ptr::null_mut();
     }
 
@@ -229,7 +263,7 @@ impl SingleSegment {
                 Ok(init) => {
                     self.length.fetch_add(1, Ordering::Acquire);
                     return AllocResult::Alloc(unsafe {
-                        NonNull::new_unchecked(self.slots.add(offset_slot * init + state.offset_t))
+                        NonNull::new_unchecked(self.slots.add(state.extra + offset_slot * init))
                             .cast()
                     });
                 }
@@ -257,25 +291,23 @@ impl SingleSegment {
 
         self.length.fetch_add(1, Ordering::Release);
 
-        AllocResult::Alloc(unsafe {
-            NonNull::new_unchecked(slot.cast::<u8>().add(state.offset_t)).cast()
-        })
+        AllocResult::Alloc(unsafe { NonNull::new_unchecked(slot).cast() })
     }
 
     #[inline]
-    unsafe fn dealloc(&self, state: StateSegment, ptr: *mut u8) -> usize {
+    unsafe fn dealloc(&self, state: StateSegment, ptr: *mut u8) -> Option<usize> {
         if self.slots.is_null() {
-            return usize::MAX;
+            return None;
         }
 
         let (layout_slots, _) = state.page_layout();
-        let start = self.slots;
-        let end = unsafe { self.slots.add(layout_slots.size()) };
+        let start = unsafe { self.slots.add(state.extra) };
+        let end = unsafe { start.add(layout_slots.size()) };
         if !(start..end).contains(&ptr) {
-            return usize::MAX;
+            return None;
         }
 
-        let ptr = unsafe { ptr.sub(state.offset_t).cast::<Slot>() };
+        let ptr = ptr.cast::<Slot>();
 
         let mut next = self.head.load(Ordering::Acquire);
         loop {
@@ -291,7 +323,7 @@ impl SingleSegment {
             }
         }
 
-        self.length.fetch_sub(1, Ordering::Acquire) - 1
+        Some(self.length.fetch_sub(1, Ordering::Acquire) - 1)
     }
 }
 
@@ -312,7 +344,7 @@ mod tests {
     const N: usize = (1 << 16) - 1;
 
     #[test]
-    fn happy_path1() {
+    fn dealloc_lifo() {
         let heap = SegmentHeap::<usize>::new();
         let mut ptrs = vec![];
         for _ in 0..N {
@@ -327,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn happy_path2() {
+    fn dealloc_fifo() {
         let heap = SegmentHeap::<usize>::new();
         let mut ptrs = vec![];
         for _ in 0..N {
@@ -342,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn happy_path3() {
+    fn dealloc_random() {
         let heap = SegmentHeap::<usize>::new();
         let mut ptrs = vec![];
         for _ in 0..N {
@@ -351,6 +383,29 @@ mod tests {
 
         ptrs.shuffle(&mut thread_rng());
         for ptr in ptrs {
+            unsafe {
+                heap.dealloc(ptr);
+            }
+        }
+    }
+
+    #[test]
+    fn size() {
+        assert_eq!(std::mem::size_of::<SegmentHeap<()>>(), 1496);
+    }
+
+    #[repr(align(8192))]
+    struct LargeAlign([u8; 8192]);
+
+    #[test]
+    fn large_alignment() {
+        let heap = SegmentHeap::<LargeAlign>::new();
+        let mut ptrs = vec![];
+        for _ in 0..N {
+            ptrs.push(heap.alloc());
+        }
+
+        for ptr in ptrs.into_iter().rev() {
             unsafe {
                 heap.dealloc(ptr);
             }
